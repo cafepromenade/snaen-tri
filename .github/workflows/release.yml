@@ -90,7 +90,14 @@ jobs:
             }
           }
           ./scripts/runtime.ps1 -In $payload -Out workspace.zip
-          Expand-Archive workspace.zip -DestinationPath source -Force
+          # Use ZipFile.ExtractToDirectory, not Expand-Archive: the latter throws
+          # "Cannot find path ... because it does not exist" on git-archive directory
+          # entries (e.g. nested empty dirs). This handles them and is much faster.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = (Resolve-Path workspace.zip).Path
+          $dest = Join-Path (Get-Location) 'source'
+          if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
 
       # Name-free build cache. Keyed by opaque project id only; the hash is over the
       # extracted source's dependency build files so a deps/CMake change invalidates it.
