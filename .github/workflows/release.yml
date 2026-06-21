@@ -1,0 +1,136 @@
+name: Generic artifact build pipeline
+
+# Privacy rules baked into this workflow:
+#   - No artifacts. Do not add actions/upload-artifact or download-artifact.
+#   - No releases or assets are ever created on THIS (public) repo.
+#     Project bodies publish releases only to their private RELEASE_TARGET secret.
+#   - builder.projects.json holds only opaque ids; names + release targets live
+#     in per-project secrets (RELEASE_TARGET_<SUFFIX>, BUILD_BUNDLE_KEY_<SUFFIX>).
+#   - Payload is refreshed frequently from the source side; this just rebuilds.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Opaque project id to run, or all
+        required: false
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  project-list:
+    runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.projects.outputs.projects }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: projects
+        shell: pwsh
+        run: |
+          $wanted = '${{ github.event.inputs.project }}'
+          if ([string]::IsNullOrWhiteSpace($wanted)) { $wanted = 'all' }
+          $config = Get-Content builder.projects.json -Raw | ConvertFrom-Json
+          $projects = @($config.projects)
+          if ($wanted -ne 'all') {
+            $projects = @($projects | Where-Object { $_.id -eq $wanted })
+          }
+          if ($projects.Count -eq 0) { throw "No matching projects for '$wanted'." }
+          $json = ConvertTo-Json @($projects) -Compress -Depth 10
+          "projects=$json" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  build:
+    needs: project-list
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(needs.project-list.outputs.projects) }}
+    runs-on: ${{ matrix.project.runner }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BUILD_BUNDLE_KEY: ${{ secrets[format('BUILD_BUNDLE_KEY_{0}', matrix.project.secret_suffix)] }}
+      PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+      TARGET_RELEASE_REPO: ${{ secrets[format('RELEASE_TARGET_{0}', matrix.project.secret_suffix)] }}
+      PROJECT_ID: ${{ matrix.project.id }}
+      # Generic, name-free cache dir a project body may use for its heavy/3rd-party
+      # build outputs (e.g. a deps prefix) so warm runs skip the slow cold build.
+      BUILD_CACHE_DIR: ${{ github.workspace }}/.build-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare source workspace
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BUILD_BUNDLE_KEY)) {
+            throw "Missing key for $env:PROJECT_ID."
+          }
+          $root = "payloads/$env:PROJECT_ID"
+          $payload = Join-Path $root 'payload.bin'
+          if (-not (Test-Path -LiteralPath $payload)) {
+            $parts = @(Get-ChildItem -LiteralPath $root -Filter 'payload.part.*' -File | Sort-Object Name)
+            if ($parts.Count -eq 0) { throw "No payload found for $env:PROJECT_ID." }
+            $out = [IO.File]::Open($payload, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try {
+              foreach ($part in $parts) {
+                $bytes = [IO.File]::ReadAllBytes($part.FullName)
+                $out.Write($bytes, 0, $bytes.Length)
+              }
+            } finally {
+              $out.Dispose()
+            }
+          }
+          ./scripts/runtime.ps1 -In $payload -Out workspace.zip
+          Expand-Archive workspace.zip -DestinationPath source -Force
+
+      # Name-free build cache. Keyed by opaque project id only; the hash is over the
+      # extracted source's dependency build files so a deps/CMake change invalidates it.
+      # Projects with no deps/ simply cache nothing. Restored after source is present so
+      # the body can reuse a warm deps prefix instead of rebuilding it every run.
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_CACHE_DIR }}
+          key: cache-${{ matrix.project.id }}-${{ runner.os }}-${{ hashFiles('source/deps/**/CMakeLists.txt', 'source/deps/**/*.cmake', 'source/deps/**/*.patch') }}
+          restore-keys: |
+            cache-${{ matrix.project.id }}-${{ runner.os }}-
+
+      - name: Run project body
+        run: |
+          $script = "workflows/$env:PROJECT_ID.ps1"
+          if (-not (Test-Path -LiteralPath $script)) { throw "Missing project body: $script" }
+          & $script
+
+      - name: Write private status
+        if: always()
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TARGET_RELEASE_REPO) -or
+              [string]::IsNullOrWhiteSpace($env:PRIVATE_RELEASE_TOKEN)) { exit 0 }
+          $env:GH_TOKEN = $env:PRIVATE_RELEASE_TOKEN
+          $rawStatus = '${{ job.status }}'
+          $icon = if ($rawStatus -eq 'success') { 'SUCCESS' } else { 'FAILED' }
+          $ts = [DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm') + ' UTC'
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $md = "# Build Status`n`n" +
+                "| | |`n|---|---|`n" +
+                "| **Status** | $icon |`n" +
+                "| **Last run** | $ts |`n" +
+                "| **Run log** | $runUrl |`n" +
+                "| **Project** | $env:PROJECT_ID |`n`n" +
+                "*Refreshes automatically every ~15 minutes.*`n"
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($md))
+          $sha = ''
+          try { $sha = gh api "repos/$env:TARGET_RELEASE_REPO/contents/STATUS.md" --jq '.sha' 2>$null } catch {}
+          $body = @{ message = "ci: status $ts"; content = $encoded }
+          if ($sha) { $body['sha'] = $sha.Trim() }
+          $body | ConvertTo-Json -Compress | gh api "repos/$env:TARGET_RELEASE_REPO/contents/STATUS.md" -X PUT --input - | Out-Null
+          Write-Host "STATUS.md -> $env:TARGET_RELEASE_REPO"
